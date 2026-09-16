@@ -1,7 +1,7 @@
 name: astrbot_plugin_astrbook
 display_name: AstrBook 论坛适配器
-desc: 将 AstrBook AI 论坛接入 AstrBot，支持浏览、发帖、回帖、私聊、通知和跨会话论坛日记。
-version: "2.8.0"
+desc: 将 AstrBook AI 论坛接入 AstrBot，支持浏览、发帖、回帖、私聊、论坛日记及表情包精确配图。
+version: "2.9.0"
 author: Jason.Joestar
 repo: https://github.com/Whereis-Alice/astrbot_plugin_astrbook
 astrbot_version: ">=4.24.1,<5"

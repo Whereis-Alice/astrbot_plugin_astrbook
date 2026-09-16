@@ -1,0 +1,385 @@
+"""Optional Magpie selection and Ferry upload orchestration for forum posts."""
+
+from __future__ import annotations
+
+import asyncio
+import ipaddress
+import re
+import time
+import uuid
+from copy import copy
+from dataclasses import dataclass, field
+from typing import Any
+from urllib.parse import quote, urlsplit
+
+from astrbot.api import logger
+from astrbot.api.platform import MessageType
+
+MAGPIE = "astrbot_plugin_meme_magpie"
+FERRY = "astrbot_plugin_imgbed_ferry"
+STATE_KEY = "astrbook_meme_candidates_v1"
+CANDIDATE_TTL = 600
+SEARCH_TIMEOUT = 20
+EXPORT_TIMEOUT = 20
+UPLOAD_TIMEOUT = 60
+
+
+class MemeBridgeError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(message)
+
+
+@dataclass
+class _Selection:
+    emoji_id: str
+    sha256: str
+    expires_at: float
+    provider: Any
+
+
+@dataclass
+class _EventState:
+    owner: Any
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    selections: dict[str, _Selection] = field(default_factory=dict)
+    integration_event: Any = None
+
+
+class MemeBridge:
+    """Use public plugin methods without importing either optional dependency."""
+
+    def __init__(self, context: Any, config: Any) -> None:
+        self.context = context
+        self.config = config
+
+    @property
+    def enabled(self) -> bool:
+        value = self.config.get("meme_enabled", True)
+        return value is True or str(value).strip().lower() in {"true", "1"}
+
+    def _plugin(self, name: str, methods: tuple[str, ...]) -> Any:
+        meta = self.context.get_registered_star(name)
+        instance = None
+        if meta is not None and getattr(meta, "activated", True):
+            instance = getattr(meta, "star_cls", None) or getattr(meta, "star", None)
+        if instance is None:
+            raise MemeBridgeError("plugin_unavailable", f"请安装并启用 {name}。")
+        if not all(callable(getattr(instance, method, None)) for method in methods):
+            raise MemeBridgeError(
+                "plugin_outdated", f"请更新 {name}，当前版本缺少联动接口。"
+            )
+        return instance
+
+    def _plugins(self) -> tuple[Any, Any]:
+        if not self.enabled:
+            raise MemeBridgeError("integration_disabled", "AstrBook 表情包联动已关闭。")
+        return (
+            self._plugin(MAGPIE, ("search_meme_candidates", "export_meme_asset")),
+            self._plugin(FERRY, ("upload_asset",)),
+        )
+
+    def available(self) -> bool:
+        try:
+            self._plugins()
+            return True
+        except Exception:  # noqa: BLE001 - optional plugins may be reloading
+            return False
+
+    def _check_session_plugins(self, event: Any) -> None:
+        # Direct integration calls do not pass through AstrBot's tool filtering;
+        # cron also skips waking_check, which normally sets plugins_name.
+        allowed = getattr(event, "plugins_name", None)
+        getter = getattr(self.context, "get_config", None)
+        if callable(getter):
+            allowed = getter(umo=event.unified_msg_origin).get("plugin_set", ["*"])
+        if isinstance(allowed, list) and "*" not in allowed:
+            for name in ("astrbot_plugin_astrbook", MAGPIE, FERRY):
+                if name not in allowed:
+                    raise MemeBridgeError(
+                        "plugin_disabled_in_session", f"当前会话配置未启用 {name}。"
+                    )
+
+    def _state(self, event: Any) -> _EventState:
+        state = event.get_extra(STATE_KEY)
+        if not isinstance(state, _EventState) or state.owner is not self:
+            state = _EventState(owner=self)
+            event.set_extra(STATE_KEY, state)
+        return state
+
+    @staticmethod
+    def _text(value: Any, maximum: int = 300) -> str:
+        return value.strip()[:maximum] if isinstance(value, str) else ""
+
+    def _integration_event(self, event: Any, state: _EventState) -> Any:
+        """Recover cron's source identity for permissions without changing its event.
+
+        AstrBot 4.25/4.28 CronMessageEvent uses the session ID as sender and
+        leaves group_id empty. Keep session, extras and role intact; use one
+        shallow event view for search, export and upload throughout this run.
+        """
+        if getattr(event, "get_platform_name", lambda: "")() != "cron":
+            return event
+        if state.integration_event is not None:
+            return state.integration_event
+        payload = event.get_extra("cron_payload", {})
+        payload = payload if isinstance(payload, dict) else {}
+        sender = self._text(payload.get("sender_id"))
+        session = event.session
+        group = self._text(event.get_group_id())
+        is_group = session.message_type == MessageType.GROUP_MESSAGE
+        if not sender:
+            raise MemeBridgeError(
+                "cron_identity_missing",
+                "未来任务缺少原发起者信息，请从原会话重新创建任务；本次仍可使用纯文字。",
+            )
+        if is_group and not group:
+            sid = self._text(session.session_id)
+            platform = self.context.get_platform_inst(session.platform_id)
+            if platform is None:
+                raise MemeBridgeError(
+                    "cron_identity_missing",
+                    "无法确认未来任务的来源平台，请恢复平台后重试。",
+                )
+            name = platform.meta().name
+            # Recognize stored unique-session formats even if the setting has
+            # since changed. Never split arbitrary IDs on every underscore.
+            separator = "%" if name == "lark" else "_"
+            prefix = sender + separator
+            if name in {
+                "aiocqhttp",
+                "slack",
+                "matrix",
+                "qq_official",
+                "qq_official_webhook",
+                "lark",
+            } and sid.startswith(prefix):
+                group = sid[len(prefix) :]
+            elif name == "misskey" and sid.endswith("_" + sender):
+                group = sid[: -(len(sender) + 1)]
+            else:
+                unique = (
+                    self.context.get_config()
+                    .get("platform_settings", {})
+                    .get("unique_session", False)
+                )
+                # Telegram has no unique-session rewrite in these AstrBot
+                # versions: its group session remains the original chat ID.
+                if (not unique or name == "telegram") and sid != sender:
+                    group = sid
+            if not group:
+                raise MemeBridgeError(
+                    "cron_identity_missing",
+                    "无法可靠恢复未来任务的原群，不能核验图床群权限；请从可识别的会话重新创建任务，或使用纯文字。",
+                )
+        view = copy(event)
+        view.message_obj = copy(event.message_obj)
+        view.message_obj.sender = copy(event.message_obj.sender)
+        view.message_obj.sender.user_id = sender
+        view.message_obj.group_id = group
+        state.integration_event = view
+        return view
+
+    async def search(
+        self, event: Any, query: str, filters: dict[str, str]
+    ) -> list[dict]:
+        """Keep selection references local to this event and search generation."""
+        query = self._text(query, 200)
+        if not query:
+            raise MemeBridgeError(
+                "invalid_query", "请提供表情包的角色、动作、图中文字或情绪关键词。"
+            )
+        magpie, _ = self._plugins()
+        self._check_session_plugins(event)
+        state = self._state(event)
+        async with state.lock:
+            state.selections.clear()
+            integration_event = self._integration_event(event, state)
+            public_filters = {
+                key: self._text(value, 100)
+                for key, value in filters.items()
+                if key in {"category", "work", "character", "tag", "scene", "emotion"}
+                and self._text(value, 100)
+            }
+            # A QQ-local meme must not become public merely because the caller
+            # asks AstrBook to publish it from that same QQ conversation.
+            public_filters["scope_mode"] = "public"
+            try:
+                candidates = await asyncio.wait_for(
+                    magpie.search_meme_candidates(
+                        integration_event, query, filters=public_filters, limit=5
+                    ),
+                    timeout=SEARCH_TIMEOUT,
+                )
+            except TimeoutError as exc:
+                raise MemeBridgeError(
+                    "search_timeout", "搜索超时，可重新搜索或使用纯文字。"
+                ) from exc
+            except Exception as exc:
+                raise MemeBridgeError(
+                    "search_failed", "表情库搜索失败，请检查 meme_magpie 日志。"
+                ) from exc
+            if not isinstance(candidates, list):
+                raise MemeBridgeError(
+                    "invalid_candidates", "表情库返回格式异常，请更新 meme_magpie。"
+                )
+            result = []
+            for candidate in candidates[:5]:
+                if (
+                    not isinstance(candidate, dict)
+                    or candidate.get("scope_mode") != "public"
+                ):
+                    continue
+                emoji_id = str(candidate.get("emoji_id") or "")
+                sha256 = self._text(candidate.get("hash")).lower()
+                if not re.fullmatch(r"(?:emoji_)?[1-9]\d*", emoji_id):
+                    continue
+                if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+                    continue
+                meme_ref = "abm_" + uuid.uuid4().hex
+                state.selections[meme_ref] = _Selection(
+                    emoji_id, sha256, time.monotonic() + CANDIDATE_TTL, magpie
+                )
+                item: dict[str, Any] = {"meme_ref": meme_ref, "emoji_id": emoji_id}
+                for key in (
+                    "desc",
+                    "category",
+                    "emotion",
+                    "work",
+                    "character",
+                    "action",
+                    "overlay_text",
+                ):
+                    item[key] = self._text(candidate.get(key))
+                for key in ("tags", "scenes"):
+                    raw = candidate.get(key)
+                    item[key] = (
+                        [self._text(v, 80) for v in raw[:10] if isinstance(v, str)]
+                        if isinstance(raw, list)
+                        else []
+                    )
+                result.append(item)
+            return result
+
+    @staticmethod
+    def _image_markdown(value: Any) -> str:
+        """Validate an absolute URL; never trust upstream filename/Markdown."""
+        if not isinstance(value, str) or not value or len(value) > 8192:
+            raise MemeBridgeError("invalid_url", "图床未返回有效的公网图片直链。")
+        try:
+            parsed = urlsplit(value)
+            host = (parsed.hostname or "").rstrip(".").lower()
+            _ = parsed.port
+            valid = (
+                parsed.scheme in {"https", "http"}
+                and bool(host)
+                and not parsed.username
+                and not parsed.password
+                and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value)
+                and "\\" not in value
+                and host != "localhost"
+                and not host.endswith((".localhost", ".local", ".internal"))
+            )
+            try:
+                valid = valid and ipaddress.ip_address(host).is_global
+            except ValueError:
+                valid = valid and "." in host
+        except ValueError:
+            valid = False
+        if not valid:
+            raise MemeBridgeError(
+                "invalid_url", "图床返回的链接不是公网 HTTP(S) 直链，请检查图床配置。"
+            )
+        # Encode Markdown delimiters without damaging an existing signed URL.
+        safe_url = quote(value, safe=":/?#[]@!$&'*+,;=%")
+        return f"![表情包](<{safe_url}>)"
+
+    async def attach(self, event: Any, content: str, meme_ref: str) -> tuple[str, bool]:
+        """Upload exactly one chosen image; never post or select a replacement."""
+        magpie, ferry = self._plugins()
+        self._check_session_plugins(event)
+        state = self._state(event)
+        async with state.lock:
+            selection = (
+                state.selections.get(meme_ref) if isinstance(meme_ref, str) else None
+            )
+            if selection is None or time.monotonic() >= selection.expires_at:
+                raise MemeBridgeError(
+                    "candidate_expired",
+                    "候选不存在或已过期，请在当前事件重新调用 search_forum_memes。",
+                )
+            if selection.provider is not magpie:
+                raise MemeBridgeError(
+                    "provider_reloaded", "表情库已重载，请重新搜索后再选择。"
+                )
+            asset = None
+            try:
+                integration_event = self._integration_event(event, state)
+                asset = await asyncio.wait_for(
+                    magpie.export_meme_asset(selection.emoji_id, integration_event),
+                    timeout=EXPORT_TIMEOUT,
+                )
+                # Another Magpie tool can replace its candidate list between
+                # calls. Comparing content hashes prevents silently using its
+                # new emoji_1 in place of the image the model actually chose.
+                if getattr(asset, "sha256", None) != selection.sha256:
+                    raise MemeBridgeError(
+                        "candidate_changed",
+                        "候选列表已变化，请重新搜索；没有替换成其他表情包。",
+                    )
+                metadata = getattr(asset, "metadata", None)
+                if (
+                    not isinstance(metadata, dict)
+                    or metadata.get("scope_mode") != "public"
+                ):
+                    raise MemeBridgeError(
+                        "scope_denied",
+                        "论坛只能使用 public 表情包，不能公开原会话专用图片。",
+                    )
+                folder = (
+                    self._text(self.config.get("meme_upload_folder"), 200)
+                    or "astrbook/memes"
+                )
+                result = await asyncio.wait_for(
+                    ferry.upload_asset(
+                        integration_event,
+                        asset,
+                        folder=folder,
+                        compress=False,
+                        output_format="markdown",
+                    ),
+                    timeout=UPLOAD_TIMEOUT,
+                )
+                if not isinstance(result, dict):
+                    raise MemeBridgeError("invalid_upload_result", "图床返回格式异常。")
+                if result.get("success") is not True:
+                    code = str(result.get("code") or "upload_failed")
+                    # Codes carry the actionable cause without exposing local
+                    # paths, credentials or raw upstream exceptions to the LLM.
+                    code = (
+                        code if re.fullmatch(r"[a-z_]{1,64}", code) else "upload_failed"
+                    )
+                    raise MemeBridgeError(
+                        code,
+                        "图床未能提供图片，请检查图床配置、权限、配额或资源有效期。",
+                    )
+                markdown = self._image_markdown(result.get("url"))
+                return f"{content.rstrip()}\n\n{markdown}", result.get("reused") is True
+            except MemeBridgeError:
+                raise
+            except TimeoutError as exc:
+                raise MemeBridgeError(
+                    "asset_timeout", "表情包导出或上传超时，可重试同一候选。"
+                ) from exc
+            except Exception as exc:
+                code = str(getattr(exc, "code", "asset_failed"))
+                code = code if re.fullmatch(r"[a-z_]{1,64}", code) else "asset_failed"
+                raise MemeBridgeError(
+                    code, "表情包导出或上传失败，请重新搜索或检查依赖插件日志。"
+                ) from exc
+            finally:
+                if asset is not None:
+                    try:
+                        asset.release()
+                    except Exception:  # noqa: BLE001 - cleanup must not mask cancellation
+                        logger.warning("[AstrBook] could not release meme asset lease")

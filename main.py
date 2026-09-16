@@ -7,9 +7,10 @@ This plugin also registers the AstrBook platform adapter.
 
 import asyncio
 import ipaddress
+import json
 import os
 import socket
-from copy import deepcopy
+from copy import copy, deepcopy
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -26,6 +27,7 @@ from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 
 from .adapter.astrbook_event import AstrBookMessageEvent
 from .adapter.forum_memory import ForumMemory
+from .meme_bridge import MemeBridge, MemeBridgeError
 
 ASTRBOOK_DEFAULT_API_BASE = "https://book.astrbot.app"
 ASTRBOOK_VALID_CATEGORIES = frozenset(
@@ -36,6 +38,7 @@ ASTRBOOK_TOOL_REQUIRED_PARAMS = {
     "browse_threads": (),
     "search_threads": ("keyword",),
     "read_thread": ("thread_id",),
+    "search_forum_memes": ("query",),
     "create_thread": ("title", "content"),
     "reply_thread": ("thread_id", "content"),
     "reply_floor": ("reply_id", "content"),
@@ -97,6 +100,7 @@ class AstrbookPlugin(Star):
         self._http_session: aiohttp.ClientSession | None = None
         self._http_session_lock = asyncio.Lock()
         self._temp_cleanup_tasks: set[asyncio.Task[Any]] = set()
+        self._meme_bridge = MemeBridge(context, config)
         # 移除末尾斜杠，避免双斜杠问题；与平台适配器使用同一个生产默认值。
         configured_api_base = str(
             config.get("api_base") or ASTRBOOK_DEFAULT_API_BASE
@@ -573,6 +577,7 @@ class AstrbookPlugin(Star):
         req: ProviderRequest,
     ):
         """Tell the model how to complete AstrBook events before each LLM call."""
+        self._remind_forum_meme_usage(event, req)
         if not self._is_astrbook_event(event):
             return
 
@@ -591,6 +596,7 @@ class AstrbookPlugin(Star):
             or event.get_extra("is_browse_event", False)
             or event.get_extra("astrbook_active_send_retry", False)
         ):
+            req.func_tool = copy(req.func_tool)
             req.func_tool.remove_tool("send_message_to_user")
 
         req.extra_user_content_parts.append(
@@ -602,6 +608,41 @@ class AstrbookPlugin(Star):
                 )
             ).mark_as_temp()
         )
+
+    def _remind_forum_meme_usage(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
+        """Guide requests that expose forum tools, including other chat platforms."""
+        bridge = getattr(self, "_meme_bridge", None)
+        if bridge is None or not bridge.available() or not req.func_tool:
+            return
+        names = {tool.name for tool in req.func_tool.tools}
+        if "search_forum_memes" not in names or not names.intersection(
+            {"create_thread", "reply_thread", "reply_floor"}
+        ):
+            return
+        req.extra_user_content_parts.append(
+            TextPart(
+                text=(
+                    "If an AstrBook forum post or reply would benefit from a meme, "
+                    "call search_forum_memes with precise keywords and filters, "
+                    "compare the returned descriptions/tags/text, then pass the chosen "
+                    "meme_ref to create_thread, reply_thread or reply_floor. These tools "
+                    "upload/reuse the exact public meme and append its Markdown image. "
+                    "Do not use magpie_send_meme to illustrate a forum post. "
+                    "No suitable candidate means use text only; never invent a meme_ref. "
+                    "Each future/scheduled task execution must search anew: store search "
+                    "criteria and forum target IDs in the task note, not old meme_ref or "
+                    "emoji_id values. A failed image step does not publish the post."
+                )
+            ).mark_as_temp()
+        )
+        if self._is_astrbook_event(event):
+            # Only this request's ToolSet changes. QQ chats and the global tool
+            # registry retain Magpie's normal image sending/searching tools.
+            req.func_tool = copy(req.func_tool)
+            for name in ("magpie_send_meme", "magpie_search_meme"):
+                req.func_tool.remove_tool(name)
 
     def _clone_astrbook_event_for_repair(
         self,
@@ -1168,20 +1209,122 @@ class AstrbookPlugin(Star):
 
         return "Got thread but format is abnormal"
 
+    @filter.llm_tool(name="search_forum_memes")
+    async def search_forum_memes(
+        self,
+        event: AstrMessageEvent,
+        query: str = "",
+        work: str = "",
+        character: str = "",
+        category: str = "",
+        tag: str = "",
+        scene: str = "",
+        emotion: str = "",
+    ) -> str:
+        """Search public memes for an AstrBook post/reply, including future tasks.
+
+        Uses meme_magpie's existing labels and search. Compare candidates and pass
+        exactly one returned meme_ref to create_thread, reply_thread or reply_floor.
+        This only searches; it does not upload, send or post anything. No match:
+        omit the meme. Search again on every scheduled execution; refs expire in
+        10 minutes, belong to this event and are replaced by the next search.
+
+        Args:
+            query(string): Precise keywords: desired action, image text, character or mood.
+            work(string): Optional work/series filter.
+            character(string): Optional character filter.
+            category(string): Optional existing meme category filter.
+            tag(string): Optional existing tag filter.
+            scene(string): Optional scene filter.
+            emotion(string): Optional emotion filter.
+        """
+        bridge = getattr(self, "_meme_bridge", None)
+        if bridge is None:
+            return (
+                "Error [plugin_unavailable]: AstrBook meme integration is unavailable."
+            )
+        try:
+            candidates = await bridge.search(
+                event,
+                query,
+                {
+                    "work": work,
+                    "character": character,
+                    "category": category,
+                    "tag": tag,
+                    "scene": scene,
+                    "emotion": emotion,
+                },
+            )
+        except MemeBridgeError as exc:
+            return f"Error [{exc.code}]: {exc}"
+        except Exception:  # noqa: BLE001 - isolate optional plugin failures
+            logger.warning("[AstrBook] meme search integration failed")
+            return "Error [search_failed]: 请检查表情库插件状态与日志。"
+        return json.dumps(
+            {
+                "candidates": candidates,
+                "instruction": (
+                    "根据角色、动作、图中文字和标签选择符合语境的一项，把 meme_ref 传给 "
+                    "create_thread/reply_thread/reply_floor；发布工具会自动配图。"
+                    "不要编造编号或使用历史候选；下一次搜索会替换本次候选。"
+                    if candidates
+                    else "没有合适的公开表情。可调整关键词重新搜索，或不传 meme_ref 使用纯文字。"
+                ),
+            },
+            ensure_ascii=False,
+        )
+
+    async def _attach_forum_meme(
+        self, event: AstrMessageEvent, content: str, meme_ref: str
+    ) -> tuple[str, str]:
+        if meme_ref == "":
+            return content, ""
+        if not isinstance(meme_ref, str) or not meme_ref.strip():
+            raise MemeBridgeError(
+                "invalid_meme_ref",
+                "meme_ref 必须是本次搜索返回的候选引用；纯文字请省略此参数。",
+            )
+        bridge = getattr(self, "_meme_bridge", None)
+        if bridge is None:
+            raise MemeBridgeError("plugin_unavailable", "AstrBook 表情包联动不可用。")
+        try:
+            content, reused = await bridge.attach(event, content, meme_ref.strip())
+        except MemeBridgeError:
+            raise
+        except Exception as exc:
+            logger.warning("[AstrBook] meme attachment integration failed")
+            raise MemeBridgeError(
+                "attachment_failed", "表情包配图失败，请检查依赖插件状态。"
+            ) from exc
+        note = (
+            "（表情包已配图，复用了图床链接）" if reused else "（表情包已上传并配图）"
+        )
+        return content, " " + note
+
     @filter.llm_tool(name="create_thread")
     async def create_thread(
-        self, event: AstrMessageEvent, title: str = "", content: str = "", category: str = "chat"
-    ):
+        self,
+        event: AstrMessageEvent,
+        title: str = "",
+        content: str = "",
+        category: str = "chat",
+        meme_ref: str = "",
+    ) -> str:
         """Create a new thread.
 
         IMPORTANT: The forum only renders images as URLs in Markdown format.
         If you want to include images, first use upload_image() to upload to the image hosting service,
         then use the returned URL in Markdown format: ![description](image_url)
+        For a meme, use search_forum_memes first and pass its exact meme_ref below;
+        the selected image is uploaded/reused and appended automatically. Works in
+        scheduled/future tasks too: search within that execution, never reuse an old ref.
 
         Args:
             title(string): Thread title, 2-100 characters
             content(string): Thread content, at least 5 characters. Use ![desc](url) for images.
             category(string): Category, one of: chat (Casual Chat), deals (Deals), misc (Miscellaneous), tech (Tech Sharing), help (Help), intro (Self Introduction), acg (Games & Anime). Default is chat.
+            meme_ref(string): Optional exact candidate from search_forum_memes in this event. Image failure prevents posting; omit for text only.
         """
         title = self._safe_text(title)
         content = self._safe_text(content)
@@ -1200,6 +1343,11 @@ class AstrbookPlugin(Star):
         if category not in valid_categories:
             category = "chat"
 
+        try:
+            content, meme_note = await self._attach_forum_meme(event, content, meme_ref)
+        except MemeBridgeError as exc:
+            return f"Error [{exc.code}]: {exc} 本次没有发帖。"
+
         result = await self._make_request(
             "POST",
             "/api/threads",
@@ -1213,20 +1361,26 @@ class AstrbookPlugin(Star):
             event.set_extra("astrbook_tool_reply_sent", True)
             return (
                 f"Thread created! ID: {result['id']}, "
-                f"Title: {result.get('title', title)}"
+                f"Title: {result.get('title', title)}{meme_note}"
             )
 
         event.set_extra("astrbook_tool_reply_sent", True)
-        return "Thread created successfully"
+        return "Thread created successfully" + meme_note
 
     @filter.llm_tool(name="reply_thread")
     async def reply_thread(
-        self, event: AstrMessageEvent, thread_id: int = 0, content: str = ""
-    ):
+        self,
+        event: AstrMessageEvent,
+        thread_id: int = 0,
+        content: str = "",
+        meme_ref: str = "",
+    ) -> str:
         """Reply to a thread (create new floor).
 
         You can mention other users by using @username in your content.
         For example: "@zhangsan I agree with your point!" will notify user zhangsan.
+        For a meme, search_forum_memes in the current execution, then pass meme_ref
+        to append that exact image automatically. This also works in future tasks.
 
         IMPORTANT: The forum only renders images as URLs in Markdown format.
         If you want to include images, first use upload_image() to upload to the image hosting service,
@@ -1235,6 +1389,7 @@ class AstrbookPlugin(Star):
         Args:
             thread_id(number): Thread ID to reply to
             content(string): Reply content. Use @username to mention someone. Use ![desc](url) for images.
+            meme_ref(string): Optional exact candidate from search_forum_memes in this event. Image failure prevents replying; omit for text only.
         """
         thread_id = self._safe_int(thread_id)
         content = self._safe_text(content)
@@ -1242,6 +1397,11 @@ class AstrbookPlugin(Star):
             return "Error: thread_id must be a positive integer"
         if not content:
             return "Reply content cannot be empty"
+
+        try:
+            content, meme_note = await self._attach_forum_meme(event, content, meme_ref)
+        except MemeBridgeError as exc:
+            return f"Error [{exc.code}]: {exc} 本次没有回复。"
 
         result = await self._make_request(
             "POST", f"/api/threads/{thread_id}/replies", data={"content": content}
@@ -1252,10 +1412,13 @@ class AstrbookPlugin(Star):
 
         if "floor_num" in result:
             event.set_extra("astrbook_tool_reply_sent", True)
-            return f"Reply successful! Your reply is on floor {result['floor_num']}"
+            return (
+                f"Reply successful! Your reply is on floor {result['floor_num']}"
+                + meme_note
+            )
 
         event.set_extra("astrbook_tool_reply_sent", True)
-        return "Reply successful"
+        return "Reply successful" + meme_note
 
     @filter.llm_tool(name="reply_floor")
     async def reply_floor(
@@ -1264,7 +1427,8 @@ class AstrbookPlugin(Star):
         reply_id: int = 0,
         content: str = "",
         reply_to_id: int | None = None,
-    ):
+        meme_ref: str = "",
+    ) -> str:
         """Sub-reply within a floor (楼中楼回复).
 
         This tool supports replying to both main floors and sub-replies:
@@ -1274,6 +1438,8 @@ class AstrbookPlugin(Star):
 
         You can mention other users by using @username in your content.
         For example: "@lisi Thanks for the help!" will notify user lisi.
+        For a meme, search_forum_memes in the current execution, then pass meme_ref
+        to append that exact image automatically. This also works in future tasks.
 
         IMPORTANT: The forum only renders images as URLs in Markdown format.
         If you want to include images, first use upload_image() to upload to the image hosting service,
@@ -1283,6 +1449,7 @@ class AstrbookPlugin(Star):
             reply_id(number): Floor/reply ID to reply to (can be main floor or sub-reply)
             content(string): Reply content. Use @username to mention someone. Use ![desc](url) for images.
             reply_to_id(number): Optional sub-reply ID to address directly; AstrBook will mention its author.
+            meme_ref(string): Optional exact candidate from search_forum_memes in this event. Image failure prevents replying; omit for text only.
         """
         reply_id = self._safe_int(reply_id)
         content = self._safe_text(content)
@@ -1298,6 +1465,13 @@ class AstrbookPlugin(Star):
                 return "Error: reply_to_id must be a positive integer"
             data["reply_to_id"] = reply_to_id
 
+        try:
+            data["content"], meme_note = await self._attach_forum_meme(
+                event, content, meme_ref
+            )
+        except MemeBridgeError as exc:
+            return f"Error [{exc.code}]: {exc} 本次没有回复。"
+
         result = await self._make_request(
             "POST", f"/api/replies/{reply_id}/sub_replies", data=data
         )
@@ -1309,7 +1483,7 @@ class AstrbookPlugin(Star):
             return f"Failed to reply: {error_msg}"
 
         event.set_extra("astrbook_tool_reply_sent", True)
-        return "Sub-reply successful"
+        return "Sub-reply successful" + meme_note
 
     @filter.llm_tool(name="get_sub_replies")
     async def get_sub_replies(

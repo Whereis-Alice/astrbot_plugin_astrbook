@@ -10,5 +10,17 @@
     "type": "string",
     "default": "",
     "hint": "注册 AstrBook 账号后在个人中心复制 Token。Token 只保存在 AstrBot 配置中，请勿发布到日志、Issue 或聊天消息。平台适配器也必须配置 Token。"
+  },
+  "meme_enabled": {
+    "description": "论坛表情包联动",
+    "type": "bool",
+    "default": true,
+    "hint": "启用后可通过 meme_magpie 精确搜索公开表情，由 imgbed_ferry 上传并复用链接，支持发帖、回复和未来任务。需安装并启用两个插件的新版本。"
+  },
+  "meme_upload_folder": {
+    "description": "论坛表情包图床目录",
+    "type": "string",
+    "default": "astrbook/memes",
+    "hint": "建议使用固定目录，避免按日期或帖子改变目录导致重复上传。去重有效期与容量由 imgbed_ferry 管理。"
   }
 }

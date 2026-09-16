@@ -28,7 +28,7 @@ from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 
 from .adapter.astrbook_event import AstrBookMessageEvent
 from .adapter.forum_memory import ForumMemory
-from .meme_bridge import MemeBridge, MemeBridgeError
+from .meme_bridge import MemeBridge, MemeBridgeError, meme_log_ref
 
 ASTRBOOK_DEFAULT_API_BASE = "https://book.astrbot.app"
 ASTRBOOK_VALID_CATEGORIES = frozenset(
@@ -1286,20 +1286,41 @@ class AstrbookPlugin(Star):
     ) -> tuple[str, str]:
         if meme_ref == "":
             return content, ""
-        if not isinstance(meme_ref, str) or not meme_ref.strip():
-            raise MemeBridgeError(
-                "invalid_meme_ref",
-                "meme_ref 必须是本次搜索返回的候选引用；纯文字请省略此参数。",
-            )
-        bridge = getattr(self, "_meme_bridge", None)
-        if bridge is None:
-            raise MemeBridgeError("plugin_unavailable", "AstrBook 表情包联动不可用。")
         try:
+            if not isinstance(meme_ref, str) or not meme_ref.strip():
+                raise MemeBridgeError(
+                    "invalid_meme_ref",
+                    "meme_ref 必须是本次搜索返回的候选引用；纯文字请省略此参数。",
+                )
+            bridge = getattr(self, "_meme_bridge", None)
+            if bridge is None:
+                raise MemeBridgeError(
+                    "plugin_unavailable", "AstrBook 表情包联动不可用。"
+                )
             content, reused = await bridge.attach(event, content, meme_ref.strip())
-        except MemeBridgeError:
+        except MemeBridgeError as exc:
+            code = (
+                exc.code
+                if re.fullmatch(r"[a-z_]{1,64}", exc.code)
+                else "attachment_failed"
+            )
+            logger.warning(
+                "[AstrBook] 表情配图失败，未发起论坛发布 | meme_ref=%s code=%s",
+                meme_log_ref(meme_ref),
+                code,
+            )
+            raise
+        except asyncio.CancelledError:
+            logger.warning(
+                "[AstrBook] 表情配图被取消，未发起论坛发布；图床状态请查上传记录 | meme_ref=%s",
+                meme_log_ref(meme_ref),
+            )
             raise
         except Exception as exc:
-            logger.warning("[AstrBook] meme attachment integration failed")
+            logger.warning(
+                "[AstrBook] 表情配图异常，未发起论坛发布 | meme_ref=%s code=attachment_failed",
+                meme_log_ref(meme_ref),
+            )
             raise MemeBridgeError(
                 "attachment_failed", "表情包配图失败，请检查依赖插件状态。"
             ) from exc
@@ -1307,6 +1328,91 @@ class AstrbookPlugin(Star):
             "（表情包已配图，复用了图床链接）" if reused else "（表情包已上传并配图）"
         )
         return content, " " + note
+
+    async def _publish_forum_content(
+        self, action: str, path: str, data: dict, meme_ref: str, target_id: int = 0
+    ) -> dict:
+        """Log the forum stage separately from the image-hosting result."""
+        ref = meme_log_ref(meme_ref)
+        logger.info(
+            "[AstrBook] 开始论坛发布 | action=%s target_id=%s meme_ref=%s",
+            action,
+            target_id,
+            ref,
+        )
+        try:
+            result = await self._make_request("POST", path, data=data)
+        except asyncio.CancelledError:
+            logger.warning(
+                "[AstrBook] 论坛发布被取消，结果未确认，请勿直接重复发布 | action=%s target_id=%s meme_ref=%s",
+                action,
+                target_id,
+                ref,
+            )
+            raise
+        except Exception:
+            logger.warning(
+                "[AstrBook] 论坛发布异常，结果未确认 | action=%s target_id=%s meme_ref=%s",
+                action,
+                target_id,
+                ref,
+            )
+            raise
+        if not isinstance(result, dict):
+            logger.warning(
+                "[AstrBook] 论坛响应格式异常，发布结果未确认 | action=%s target_id=%s meme_ref=%s",
+                action,
+                target_id,
+                ref,
+            )
+        elif "error" in result:
+            # Upstream error bodies can contain credentials or echoed content.
+            # Log only known error categories/status codes, not the raw body.
+            error = str(result["error"])
+            code = {
+                "Token not configured. Please set 'token' in plugin config.": "token_not_configured",
+                "Request timeout": "timeout",
+                "Token invalid or expired": "unauthorized",
+                "Resource not found": "not_found",
+            }.get(error, "request_error")
+            status = re.match(r"Request failed: ([45]\d{2})\b", error)
+            if status:
+                code = "http_" + status[1]
+            elif error.startswith("Cannot connect to server:"):
+                code = "connect_error"
+            outcome = (
+                "论坛发布结果未确认"
+                if code in {"timeout", "request_error"}
+                else "论坛发布失败"
+            )
+            if code == "token_not_configured":
+                outcome = "论坛 Token 未配置，未发起论坛请求"
+            logger.warning(
+                "[AstrBook] %s | action=%s target_id=%s meme_ref=%s code=%s",
+                outcome,
+                action,
+                target_id,
+                ref,
+                code,
+            )
+        else:
+            receipt_id = self._safe_int(result.get("id"))
+            confirmed = receipt_id > 0
+            outcome = (
+                "论坛发布成功"
+                if confirmed
+                else "论坛响应未含有效 ID，发布结果未确认，请查看论坛"
+            )
+            log_result = logger.info if confirmed else logger.warning
+            log_result(
+                "[AstrBook] %s | action=%s target_id=%s result_id=%s meme_ref=%s",
+                outcome,
+                action,
+                target_id,
+                receipt_id,
+                ref,
+            )
+        return result
 
     @staticmethod
     def _title_from_content(content: str) -> str:
@@ -1393,10 +1499,11 @@ class AstrbookPlugin(Star):
         except MemeBridgeError as exc:
             return f"Error [{exc.code}]: {exc} 本次没有发帖。"
 
-        result = await self._make_request(
-            "POST",
+        result = await self._publish_forum_content(
+            "create_thread",
             "/api/threads",
             data={"title": title, "content": content, "category": category},
+            meme_ref=meme_ref,
         )
 
         if "error" in result:
@@ -1454,8 +1561,12 @@ class AstrbookPlugin(Star):
         except MemeBridgeError as exc:
             return f"Error [{exc.code}]: {exc} 本次没有回复。"
 
-        result = await self._make_request(
-            "POST", f"/api/threads/{thread_id}/replies", data={"content": content}
+        result = await self._publish_forum_content(
+            "reply_thread",
+            f"/api/threads/{thread_id}/replies",
+            data={"content": content},
+            meme_ref=meme_ref,
+            target_id=thread_id,
         )
 
         if "error" in result:
@@ -1523,8 +1634,12 @@ class AstrbookPlugin(Star):
         except MemeBridgeError as exc:
             return f"Error [{exc.code}]: {exc} 本次没有回复。"
 
-        result = await self._make_request(
-            "POST", f"/api/replies/{reply_id}/sub_replies", data=data
+        result = await self._publish_forum_content(
+            "reply_floor",
+            f"/api/replies/{reply_id}/sub_replies",
+            data=data,
+            meme_ref=meme_ref,
+            target_id=reply_id,
         )
 
         if "error" in result:

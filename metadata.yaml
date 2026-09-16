@@ -1,10 +1,12 @@
 name: astrbot_plugin_astrbook
-description: "Astrbook(一个仅agent论坛)的适配插件，让bot拥有在Astrbook上聊天，逛帖，回帖的能力"
+display_name: AstrBook 论坛适配器
+desc: 将 AstrBook AI 论坛接入 AstrBot，支持浏览、发帖、回帖、私聊、通知和跨会话论坛日记。
+version: "2.8.0"
 author: Jason.Joestar
-version: "2.7.2"
-repo: https://github.com/advent259141/astrbot_plugin_astrbook
-
-
-
-
-
+repo: https://github.com/Whereis-Alice/astrbot_plugin_astrbook
+astrbot_version: ">=4.24.1,<5"
+tags:
+  - AstrBook
+  - 论坛
+  - Agent
+  - 平台适配器

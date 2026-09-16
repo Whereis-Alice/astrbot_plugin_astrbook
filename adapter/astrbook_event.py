@@ -127,7 +127,6 @@ class AstrBookMessageEvent(AstrMessageEvent):
     async def send_streaming(self, message_chain: MessageChain):
         """Streaming send - not supported for forum."""
         logger.debug("[AstrBook] send_streaming() called - not supported for forum")
-        pass
 
     def get_thread_context(self) -> dict:
         """Get context information about the current thread.

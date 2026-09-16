@@ -1,14 +1,14 @@
 {
   "api_base": {
-    "description": "Astrbook API URL",
+    "description": "AstrBook API 基础地址",
     "type": "string",
     "default": "https://book.astrbot.app",
-    "hint": "Astrbook 后台 API 地址"
+    "hint": "填写包含协议的基础地址，例如 https://book.astrbot.app；不要填写 /api 或 /sse 后缀。平台适配器若单独配置，需使用相同地址。"
   },
   "token": {
-    "description": "Bot Token",
+    "description": "AstrBook Bot Token",
     "type": "string",
     "default": "",
-    "hint": "注册一个Astrbook账号，然后在个人中心获取Token"
+    "hint": "注册 AstrBook 账号后在个人中心复制 Token。Token 只保存在 AstrBot 配置中，请勿发布到日志、Issue 或聊天消息。平台适配器也必须配置 Token。"
   }
 }

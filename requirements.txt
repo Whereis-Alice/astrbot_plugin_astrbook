@@ -1,0 +1,4 @@
+# AstrBot supplies the MCP runtime and its ``mcp.types`` package.  Keep only
+# the plugin's direct third-party dependency here to avoid replacing the host's
+# pinned MCP version during plugin installation.
+aiohttp>=3.9,<4

@@ -8,12 +8,14 @@ real-time notifications and scheduled browsing capabilities.
 import asyncio
 import hashlib
 import inspect
+import math
 import random
 import time
 import uuid
 from collections.abc import Coroutine
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 from astrbot import logger
@@ -42,6 +44,92 @@ ASTRBOOK_DEFAULT_CONFIG_TMPL = {
     "reply_probability": 0.3,  # Probability to trigger LLM reply (0.0-1.0)
     "custom_prompt": "",  # Custom browse prompt, leave empty to use default
 }
+
+# Keep adapter-side limits defensive.  Values in platform configuration are
+# user-editable (and may arrive as strings/None), so never let an invalid value
+# create a busy loop or an unbounded memory file.
+ASTRBOOK_MIN_BROWSE_INTERVAL = 30
+ASTRBOOK_MAX_BROWSE_INTERVAL = 7 * 24 * 60 * 60
+ASTRBOOK_MIN_MEMORY_ITEMS = 1
+ASTRBOOK_MAX_MEMORY_ITEMS = 1000
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    """Parse common JSON/UI boolean representations without truthiness traps."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "y", "是", "开启"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "n", "否", "关闭"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
+def _normalize_api_base(value: Any) -> str:
+    """Return a usable HTTP(S) API base without transport suffixes.
+
+    Users often copy the API or SSE endpoint itself into the platform setting.
+    The adapter appends those paths internally, so normalize a trailing
+    ``/api`` or ``/sse`` (including ``/api/sse``) to avoid doubled endpoints.
+    """
+
+    candidate = value.strip().rstrip("/") if isinstance(value, str) else ""
+    parsed = urlparse(candidate)
+    try:
+        _ = parsed.port
+        valid_port = True
+    except ValueError:
+        valid_port = False
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or not valid_port
+    ):
+        return str(ASTRBOOK_DEFAULT_CONFIG_TMPL["api_base"])
+    path_parts = [part for part in parsed.path.split("/") if part]
+    while path_parts and path_parts[-1].lower() in {"api", "sse"}:
+        path_parts.pop()
+    normalized_path = "/" + "/".join(path_parts) if path_parts else ""
+    return parsed._replace(path=normalized_path).geturl().rstrip("/")
+
+
+def _clamp_int(
+    value: Any,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def _clamp_float(
+    value: Any,
+    *,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    if not math.isfinite(parsed):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
 
 ASTRBOOK_I18N_RESOURCES = {
     "zh-CN": {
@@ -211,18 +299,49 @@ class AstrBookAdapter(Platform):
     ) -> None:
         super().__init__(platform_config, event_queue)
 
-        self.settings = platform_settings
-        self.api_base = platform_config.get("api_base", "https://book.astrbot.app")
-        self.token = platform_config.get("token", "")
-        self.auto_browse = platform_config.get("auto_browse", True)
-        self.browse_interval = int(platform_config.get("browse_interval", 3600))
-        self.auto_reply_mentions = platform_config.get("auto_reply_mentions", True)
-        self.max_memory_items = int(platform_config.get("max_memory_items", 50))
-        self.reply_probability = float(platform_config.get("reply_probability", 0.3))
-        self.custom_prompt = platform_config.get("custom_prompt", "")
+        self.settings = platform_settings or {}
+        configured_api_base = platform_config.get("api_base")
+        self.api_base = _normalize_api_base(configured_api_base)
+
+        configured_token = platform_config.get("token", "")
+        self.token = configured_token.strip() if isinstance(configured_token, str) else ""
+        self.auto_browse = _coerce_bool(
+            platform_config.get("auto_browse", True),
+            True,
+        )
+        self.browse_interval = _clamp_int(
+            platform_config.get("browse_interval", 3600),
+            default=3600,
+            minimum=ASTRBOOK_MIN_BROWSE_INTERVAL,
+            maximum=ASTRBOOK_MAX_BROWSE_INTERVAL,
+        )
+        self.auto_reply_mentions = _coerce_bool(
+            platform_config.get("auto_reply_mentions", True),
+            True,
+        )
+        self.max_memory_items = _clamp_int(
+            platform_config.get("max_memory_items", 50),
+            default=50,
+            minimum=ASTRBOOK_MIN_MEMORY_ITEMS,
+            maximum=ASTRBOOK_MAX_MEMORY_ITEMS,
+        )
+        self.reply_probability = _clamp_float(
+            platform_config.get("reply_probability", 0.3),
+            default=0.3,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        configured_prompt = platform_config.get("custom_prompt", "")
+        self.custom_prompt = (
+            configured_prompt.strip() if isinstance(configured_prompt, str) else ""
+        )
 
         # id 从 platform_config 获取，是该适配器实例的唯一标识
         platform_id = platform_config.get("id", "astrbook_default")
+        if not isinstance(platform_id, str) or not platform_id.strip():
+            platform_id = "astrbook_default"
+        else:
+            platform_id = platform_id.strip()
         self._metadata = PlatformMetadata(
             name="astrbook",
             description="AstrBook 论坛适配器",
@@ -247,7 +366,12 @@ class AstrBookAdapter(Platform):
         self._active_send_receipt_limit = 50
 
         # Running tasks
-        self._tasks: list[asyncio.Task] = []
+        self._tasks: list[asyncio.Task[Any]] = []
+        self._run_active = False
+        self._terminating = False
+        self._lifecycle_lock = asyncio.Lock()
+        self._browse_lock = asyncio.Lock()
+        self._manual_browse_task: asyncio.Task[Any] | None = None
 
     def meta(self) -> PlatformMetadata:
         return self._metadata
@@ -459,10 +583,10 @@ class AstrBookAdapter(Platform):
             params = {"target_user_id": target_id, "limit": 10}
         elif kind == "reply":
             endpoint = f"/api/replies/{target_id}/sub_replies"
-            params = {"page": 1, "page_size": 20}
+            params = {"page": 1, "page_size": 20, "format": "json"}
         elif kind == "thread":
             endpoint = f"/api/threads/{target_id}"
-            params = {"page": 1, "page_size": 20}
+            params = {"page": 1, "page_size": 20, "format": "json"}
         else:
             return receipt
 
@@ -686,6 +810,42 @@ class AstrBookAdapter(Platform):
             error=error,
         )
 
+    def _track_task(
+        self,
+        task: asyncio.Task[Any],
+        label: str,
+    ) -> asyncio.Task[Any]:
+        """Track a background task and report unexpected failures once.
+
+        Platform adapters may be started/stopped more than once during a plugin
+        reload.  Keeping one canonical task list lets ``terminate`` cancel all
+        work, including a manually-triggered browse task.
+        """
+
+        self._tasks.append(task)
+
+        def _on_done(done: asyncio.Task[Any]) -> None:
+            try:
+                self._tasks.remove(done)
+            except ValueError:
+                pass
+            if done.cancelled():
+                return
+            try:
+                error = done.exception()
+            except asyncio.CancelledError:
+                return
+            if error is not None:
+                logger.error(
+                    "[AstrBook] %s task stopped unexpectedly: %s",
+                    label,
+                    error,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(_on_done)
+        return task
+
     def run(self) -> Coroutine[Any, Any, None]:
         """Main entry point for the adapter."""
         return self._run()
@@ -696,44 +856,99 @@ class AstrBookAdapter(Platform):
             logger.error("[AstrBook] Token not configured, adapter disabled")
             return
 
-        logger.info("[AstrBook] Starting AstrBook platform adapter...")
+        async with self._lifecycle_lock:
+            if self._run_active:
+                logger.warning("[AstrBook] Adapter is already running; ignoring duplicate run()")
+                return
+            self._run_active = True
+            self._terminating = False
+            # A previous run may have left completed callback tasks behind.
+            self._tasks = [task for task in self._tasks if not task.done()]
 
-        conn_task = asyncio.create_task(self._sse_loop())
-        self._tasks.append(conn_task)
+            logger.info("[AstrBook] Starting AstrBook platform adapter...")
 
-        if self.auto_browse:
-            browse_task = asyncio.create_task(self._auto_browse_loop())
-            self._tasks.append(browse_task)
+            run_tasks: list[asyncio.Task[Any]] = []
+            conn_task = self._track_task(
+                asyncio.create_task(self._sse_loop(), name="astrbook-sse"),
+                "SSE",
+            )
+            run_tasks.append(conn_task)
+
+            if self.auto_browse:
+                browse_task = self._track_task(
+                    asyncio.create_task(
+                        self._auto_browse_loop(),
+                        name="astrbook-auto-browse",
+                    ),
+                    "auto-browse",
+                )
+                run_tasks.append(browse_task)
 
         try:
-            await asyncio.gather(*self._tasks)
+            await asyncio.gather(*run_tasks)
         except asyncio.CancelledError:
             logger.info("[AstrBook] Adapter tasks cancelled")
+        finally:
+            self._run_active = False
+
+    def trigger_browse(self) -> asyncio.Task[Any] | None:
+        """Schedule one manual browse and keep it in the lifecycle task set.
+
+        If a manual browse is already running, return that task instead of
+        creating a duplicate event.  The caller may await the returned task or
+        simply use it as a status handle.
+        """
+
+        if self._terminating:
+            logger.warning("[AstrBook] Ignoring manual browse while terminating")
+            return None
+        if self._manual_browse_task and not self._manual_browse_task.done():
+            return self._manual_browse_task
+        try:
+            task = asyncio.create_task(
+                self._do_browse(),
+                name="astrbook-manual-browse",
+            )
+        except RuntimeError:
+            logger.warning("[AstrBook] Cannot schedule manual browse outside an event loop")
+            return None
+        self._manual_browse_task = self._track_task(task, "manual-browse")
+        return task
 
     async def terminate(self):
         """Terminate the adapter."""
-        logger.info("[AstrBook] Terminating adapter...")
+        async with self._lifecycle_lock:
+            if self._terminating and not self._tasks:
+                # Keep terminate() safe when AstrBot calls it more than once.
+                self._run_active = False
+                self._connected = False
+                return
 
-        # Cancel all running tasks
-        for task in self._tasks:
-            if not task.done():
-                task.cancel()
+            logger.info("[AstrBook] Terminating adapter...")
+            self._terminating = True
+            current_task = asyncio.current_task()
+            tasks = list(dict.fromkeys(self._tasks))
+            for task in tasks:
+                if task is not current_task and not task.done():
+                    task.cancel()
 
-        # Wait for tasks to actually finish
-        for task in self._tasks:
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-        self._tasks.clear()
+            # Wait for tasks to actually finish.  Do not await the task that is
+            # currently executing terminate(), which would deadlock.
+            wait_tasks = [task for task in tasks if task is not current_task]
+            if wait_tasks:
+                await asyncio.gather(*wait_tasks, return_exceptions=True)
+            self._tasks.clear()
+            self._manual_browse_task = None
 
-        # Close SSE session
-        if self._sse_session and not self._sse_session.closed:
-            await self._sse_session.close()
+            # Close SSE session (the connection coroutine also closes it in its
+            # own finally block; this second check makes cleanup race-safe).
+            if self._sse_session and not self._sse_session.closed:
+                await self._sse_session.close()
 
-        self._sse_session = None
-        self._connected = False
-        logger.info("[AstrBook] Adapter terminated")
+            self._sse_session = None
+            self._connected = False
+            self._run_active = False
+            logger.info("[AstrBook] Adapter terminated")
 
     # ==================== SSE Connection ====================
 
@@ -783,7 +998,7 @@ class AstrBookAdapter(Platform):
             bool: True if authentication failed (401), False otherwise.
         """
         # Build SSE URL from api_base
-        sse_url = f"{self.api_base}/sse/bot?token={self.token}"
+        sse_url = f"{self.api_base}/sse/bot"
 
         # ✅ 先关闭旧的 session，避免连接泄漏
         if self._sse_session and not self._sse_session.closed:
@@ -797,6 +1012,7 @@ class AstrBookAdapter(Platform):
         try:
             async with session.get(
                 sse_url,
+                params={"token": self.token},
                 headers={"Accept": "text/event-stream"},
                 timeout=aiohttp.ClientTimeout(total=None, sock_read=None),
             ) as resp:
@@ -815,19 +1031,29 @@ class AstrBookAdapter(Platform):
                 self._connected = True
                 logger.info("[AstrBook] SSE connected successfully")
 
-                # Parse SSE stream
+                # Parse SSE stream.  SSE permits either LF or CRLF line
+                # endings, and a server may split a delimiter across network
+                # chunks, so normalize the accumulated buffer before looking
+                # for the blank-line event separator.
                 buffer = ""
                 async for chunk in resp.content:
                     if not chunk:
                         continue
 
                     text = chunk.decode("utf-8", errors="replace")
-                    buffer += text
+                    buffer = (buffer + text).replace("\r\n", "\n").replace("\r", "\n")
 
-                    # Process complete SSE messages (separated by double newline)
+                    # Process complete SSE messages (separated by a blank line).
                     while "\n\n" in buffer:
                         message_block, buffer = buffer.split("\n\n", 1)
                         await self._parse_sse_block(message_block)
+
+                # A clean EOF is allowed to terminate an event without an
+                # additional blank line.  Do not silently discard that final
+                # event (this is common with short-lived test/mock streams).
+                buffer = buffer.replace("\r\n", "\n").replace("\r", "\n")
+                if buffer.strip():
+                    await self._parse_sse_block(buffer)
 
         finally:
             self._connected = False
@@ -842,11 +1068,14 @@ class AstrBookAdapter(Platform):
 
         data_lines = []
 
-        for line in block.split("\n"):
-            if line.startswith("event: "):
+        for line in block.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            # The optional space after a field name is not required by the SSE
+            # specification.  Accept both ``data:{...}`` and ``data: {...}``.
+            if line.startswith("event:"):
                 continue
-            elif line.startswith("data: "):
-                data_lines.append(line[6:])
+            elif line.startswith("data:"):
+                value = line[5:]
+                data_lines.append(value.removeprefix(" "))
             elif line.startswith(":"):
                 # SSE comment (keep-alive ping), ignore
                 pass
@@ -859,6 +1088,13 @@ class AstrBookAdapter(Platform):
             data = json.loads(data_str)
         except json.JSONDecodeError:
             logger.warning(f"[AstrBook] Failed to parse SSE data: {data_str[:100]}")
+            return
+
+        if not isinstance(data, dict):
+            logger.warning(
+                "[AstrBook] Ignoring non-object SSE data: %s",
+                type(data).__name__,
+            )
             return
 
         # Handle the message from SSE payload.
@@ -895,6 +1131,35 @@ class AstrBookAdapter(Platform):
         content = data.get("content", "")
         reply_id = data.get("reply_id")
         msg_type = data.get("type")
+
+        # A mention is optional: when disabled, leave it on the server for
+        # explicit inspection through check_notifications(), but do not wake
+        # the agent or consume the notification here.
+        if msg_type == "mention" and not self.auto_reply_mentions:
+            logger.info(
+                "[AstrBook] Ignoring mention notification because "
+                "auto_reply_mentions is disabled (thread=%s, reply=%s)",
+                thread_id,
+                reply_id,
+            )
+            return
+
+        # AstrBook may emit an SSE notification for the bot's own reply.  Do
+        # not turn that echo into another agent event (which can otherwise
+        # create a reply loop).  Compare as strings because API payloads have
+        # varied between integer and string IDs.
+        if (
+            self.bot_user_id is not None
+            and from_user_id is not None
+            and str(self.bot_user_id) == str(from_user_id)
+        ):
+            logger.debug(
+                "[AstrBook] Ignoring self-authored notification (type=%s, thread=%s, reply=%s)",
+                msg_type,
+                thread_id,
+                reply_id,
+            )
+            return
 
         logger.info(
             f"[AstrBook] Notification: {msg_type} from {from_username} "
@@ -964,21 +1229,19 @@ class AstrBookAdapter(Platform):
         event.set_extra("reply_id", reply_id)
         event.set_extra("notification_type", msg_type)
 
-        # Randomly decide whether to trigger LLM based on probability
-        # Notifications are always saved to memory, but LLM is only triggered probabilistically
-        # This prevents infinite loops between bots while allowing natural conversations
-        if random.random() > self.reply_probability:
+        # Randomly decide whether to trigger LLM based on probability.  The
+        # notification stays available through the forum inbox when skipped.
+        # ``>=`` preserves the exact boundary semantics: 0.0 never wakes the
+        # model and 1.0 always does.
+        if random.random() >= self.reply_probability:
             logger.info(
-                f"[AstrBook] Notification from {from_username} saved to memory but LLM not triggered "
+                f"[AstrBook] Notification from {from_username} did not trigger the LLM "
                 f"(probability={self.reply_probability:.0%}). Thread {thread_id} can be replied manually."
             )
-            return  # Don't trigger LLM, but notification is already saved to memory above
+            return
 
         event.is_wake = True
         event.is_at_or_wake_command = True  # Required to trigger LLM
-
-        # 触发了 LLM 才标记通知为已读
-        await self._mark_notifications_read()
 
         self.commit_event(event)
         logger.info(
@@ -996,13 +1259,13 @@ class AstrBookAdapter(Platform):
         content = message.get("content", "")
         dm_message_id = message.get("id")
 
-        if self.bot_user_id is not None and sender_id is not None:
-            try:
-                if int(sender_id) == int(self.bot_user_id):
-                    # Ignore self-sent DM push to avoid self-trigger loops.
-                    return
-            except Exception:
-                pass
+        if (
+            self.bot_user_id is not None
+            and sender_id is not None
+            and str(sender_id) == str(self.bot_user_id)
+        ):
+            # Ignore self-sent DM push to avoid self-trigger loops.
+            return
 
         logger.info(
             f"[AstrBook] DM message from {sender_nickname} "
@@ -1057,9 +1320,9 @@ class AstrBookAdapter(Platform):
             event._build_plain_response_repair_prompt(),
         )
 
-        if random.random() > self.reply_probability:
+        if random.random() >= self.reply_probability:
             logger.info(
-                f"[AstrBook] DM from {sender_nickname} saved but LLM not triggered "
+                f"[AstrBook] DM from {sender_nickname} did not trigger the LLM "
                 f"(probability={self.reply_probability:.0%})."
             )
             return
@@ -1091,62 +1354,54 @@ class AstrBookAdapter(Platform):
 
         logger.debug(f"[AstrBook] New thread: {thread_title} by {author}")
 
-    async def _mark_notifications_read(self):
-        """Mark all notifications as read via API."""
-        if not self.token:
-            logger.warning("[AstrBook] Token not configured, cannot mark read")
-            return
-
-        url = f"{self.api_base}/api/notifications/read-all"
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-            "Accept-Encoding": "gzip, deflate",
-        }
-        try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=40)
-            ) as session:
-                async with session.post(url, headers=headers) as resp:
-                    if 200 <= resp.status < 300:
-                        logger.debug("[AstrBook] Notifications marked as read")
-                        return
-                    text = await resp.text()
-                    logger.warning(
-                        "[AstrBook] Error marking notifications as read: %s - %s",
-                        resp.status,
-                        text[:200] if text else "No response",
-                    )
-        except asyncio.TimeoutError:
-            logger.warning("[AstrBook] Error marking notifications as read: timeout")
-        except aiohttp.ClientConnectorError:
-            logger.warning(
-                "[AstrBook] Error marking notifications as read: cannot connect to %s",
-                self.api_base,
-            )
-        except Exception as e:
-            logger.warning(
-                "[AstrBook] Error marking notifications as read: %s",
-                e,
-                exc_info=True,
-            )
-
     # ==================== Auto Browse ====================
 
     async def _auto_browse_loop(self):
         """Periodically browse the forum and create browsing events."""
         await asyncio.sleep(60)
 
-        while True:
+        while not self._terminating:
             try:
                 await self._do_browse()
             except Exception as e:
                 logger.error(f"[AstrBook] Error in auto browse: {e}")
 
+            if self._terminating:
+                break
             await asyncio.sleep(self.browse_interval)
 
-    async def _do_browse(self):
-        """Perform a forum browsing session."""
+    async def _do_browse(self) -> bool:
+        """Perform one serialized forum browsing session.
+
+        Automatic and manually-triggered browsing share the same AstrBook
+        session.  Serializing them prevents two wake events from racing and
+        makes ``/astrbook browse`` safe while the periodic task is active.
+
+        Returns ``True`` when an event was committed, or ``False`` when the
+        request was skipped because the adapter is terminating or another
+        browse trigger is already being processed.
+        """
+
+        if self._terminating:
+            logger.debug("[AstrBook] Skipping browse while adapter is terminating")
+            return False
+        if self._browse_lock.locked():
+            logger.info("[AstrBook] Skipping duplicate browse; one is already starting")
+            return False
+
+        async with self._browse_lock:
+            if self._terminating:
+                logger.debug("[AstrBook] Skipping browse while adapter is terminating")
+                return False
+            try:
+                return await self._do_browse_once()
+            finally:
+                current_task = asyncio.current_task()
+                if self._manual_browse_task is current_task:
+                    self._manual_browse_task = None
+
+    async def _do_browse_once(self) -> bool:
+        """Build and commit a single isolated browsing event."""
         logger.info("[AstrBook] Starting auto-browse session...")
 
         # Just send prompt to LLM, let it decide what to do
@@ -1177,11 +1432,20 @@ class AstrBookAdapter(Platform):
         )
 
         event.set_extra("is_browse_event", True)
+        # Keep the event's public/session routing ID stable so the plugin can
+        # remove AstrBot's generic active-send tool.  Do not attach a custom
+        # ProviderRequest here: when no request is supplied AstrBot creates a
+        # normal session conversation first, which is what injects the active
+        # persona and the plugin tool set.  The plugin's OnLLMRequest hook then
+        # detaches that conversation (and clears its history) immediately
+        # before the runner starts, so browse turns keep persona/tools without
+        # accumulating automatic-browse history in the database.
         event.is_wake = True
         event.is_at_or_wake_command = True  # Required to trigger LLM
 
         self.commit_event(event)
         logger.info("[AstrBook] Browse event committed, waiting for LLM to browse...")
+        return True
 
     def _format_browse_content(self) -> str:
         """Format browse prompt for LLM."""

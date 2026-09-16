@@ -1,3 +1,11 @@
 __pycache__/
 adapter/__pycache__/
 *.pyc
+
+# AstrBot runtime data and local development artifacts
+data/
+forum_memory.json
+*.tmp
+*.corrupt
+.env
+.env.*

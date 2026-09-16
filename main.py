@@ -9,6 +9,7 @@ import asyncio
 import ipaddress
 import json
 import os
+import re
 import socket
 from copy import copy, deepcopy
 from pathlib import Path
@@ -39,7 +40,7 @@ ASTRBOOK_TOOL_REQUIRED_PARAMS = {
     "search_threads": ("keyword",),
     "read_thread": ("thread_id",),
     "search_forum_memes": ("query",),
-    "create_thread": ("title", "content"),
+    "create_thread": ("content",),
     "reply_thread": ("thread_id", "content"),
     "reply_floor": ("reply_id", "content"),
     "get_sub_replies": ("reply_id",),
@@ -634,6 +635,9 @@ class AstrbookPlugin(Star):
                     "Each future/scheduled task execution must search anew: store search "
                     "criteria and forum target IDs in the task note, not old meme_ref or "
                     "emoji_id values. A failed image step does not publish the post."
+                    " When creating a thread, prefer create_thread(title='a short title', "
+                    "content='the full post', meme_ref='the chosen reference'). If title "
+                    "is omitted, it is extracted from the post's readable text."
                 )
             ).mark_as_temp()
         )
@@ -1267,6 +1271,8 @@ class AstrbookPlugin(Star):
                 "instruction": (
                     "根据角色、动作、图中文字和标签选择符合语境的一项，把 meme_ref 传给 "
                     "create_thread/reply_thread/reply_floor；发布工具会自动配图。"
+                    "新帖推荐调用 create_thread(title='概括正文的标题', content='完整正文', "
+                    "meme_ref='本次候选')；省略 title 时会从正文提取短标题。"
                     "不要编造编号或使用历史候选；下一次搜索会替换本次候选。"
                     if candidates
                     else "没有合适的公开表情。可调整关键词重新搜索，或不传 meme_ref 使用纯文字。"
@@ -1302,6 +1308,36 @@ class AstrbookPlugin(Star):
         )
         return content, " " + note
 
+    @staticmethod
+    def _title_from_content(content: str) -> str:
+        """Extract a bounded title from existing prose without a second LLM call."""
+        text = re.sub(r"```.*?(?:```|$)|~~~.*?(?:~~~|$)", " ", content, flags=re.S)
+        text = re.sub(
+            r"!\[[^\]]*\]\((?:[^()\n]|\([^()\n]*\))*\)|!\[[^\]]*\]\[[^\]]*\]",
+            " ",
+            text,
+        )
+        text = re.sub(r"^\s*\[[^\]]+\]:.*$", "", text, flags=re.M)
+        text = re.sub(
+            r"\[([^\]]+)\]\((?:[^()\n]|\([^()\n]*\))*\)|\[([^\]]+)\]\[[^\]]*\]",
+            lambda m: m[1] or m[2],
+            text,
+        )
+        text = re.sub(r"<[^>]*>|https?://\S+", " ", text)
+        text = re.sub(
+            r"^\s*(?:#{1,6}\s+|>\s*|[-*+]\s+|\d+[.)]\s+)+", "", text, flags=re.M
+        )
+        text = re.sub(r"[*_`~]", "", text)
+        lines = [" ".join(line.split()) for line in text.splitlines()]
+        lines = [line for line in lines if any(char.isalnum() for char in line)]
+        if not lines:
+            return ""
+        title = re.split(r"[。！？!?]|\.(?:\s|$)", lines[0], maxsplit=1)[0].strip()
+        if len(title) < 2:
+            title = " ".join(lines)
+        title = title[:60].rstrip()
+        return title if len(title) >= 2 and any(c.isalnum() for c in title) else ""
+
     @filter.llm_tool(name="create_thread")
     async def create_thread(
         self,
@@ -1313,6 +1349,10 @@ class AstrbookPlugin(Star):
     ) -> str:
         """Create a new thread.
 
+        Prefer create_thread(title="short title", content="full post", meme_ref="chosen ref").
+        Content is required. If title is omitted/blank, a short title is extracted
+        from the existing readable content; do not inspect source files to supply it.
+
         IMPORTANT: The forum only renders images as URLs in Markdown format.
         If you want to include images, first use upload_image() to upload to the image hosting service,
         then use the returned URL in Markdown format: ![description](image_url)
@@ -1321,21 +1361,26 @@ class AstrbookPlugin(Star):
         scheduled/future tasks too: search within that execution, never reuse an old ref.
 
         Args:
-            title(string): Thread title, 2-100 characters
+            title(string): Optional thread title, 2-100 characters. Prefer supplying one; omitted/blank titles are extracted from readable content (up to 60 characters).
             content(string): Thread content, at least 5 characters. Use ![desc](url) for images.
             category(string): Category, one of: chat (Casual Chat), deals (Deals), misc (Miscellaneous), tech (Tech Sharing), help (Help), intro (Self Introduction), acg (Games & Anime). Default is chat.
             meme_ref(string): Optional exact candidate from search_forum_memes in this event. Image failure prevents posting; omit for text only.
         """
+        if title is not None and not isinstance(title, str):
+            return "Error: title must be a string (2-100 chars), or omitted to use the content."
         title = self._safe_text(title)
         content = self._safe_text(content)
-        if not title:
-            return "Error: title is required (2-100 chars)"
-        if len(title) < 2 or len(title) > 100:
+        if title and (len(title) < 2 or len(title) > 100):
             return "Title must be 2-100 characters"
         if not content:
             return "Error: content is required (at least 5 chars)"
         if len(content) < 5:
             return "Content must be at least 5 characters"
+        automatic_title = not title
+        if automatic_title:
+            title = self._title_from_content(content)
+            if not title:
+                return "Error: 请提供 title（2-100 字）；正文没有可用于提取标题的文字。本次没有发帖，也没有上传图片。"
 
         # 验证分类
         category = self._safe_text(category).lower()
@@ -1359,12 +1404,18 @@ class AstrbookPlugin(Star):
 
         if "id" in result:
             event.set_extra("astrbook_tool_reply_sent", True)
+            title_note = " (extracted from content)" if automatic_title else ""
             return (
                 f"Thread created! ID: {result['id']}, "
-                f"Title: {result.get('title', title)}{meme_note}"
+                f"Title: {result.get('title', title)}{title_note}{meme_note}"
             )
 
         event.set_extra("astrbook_tool_reply_sent", True)
+        if automatic_title:
+            return (
+                f"Thread created successfully. Title: {title} (extracted from content)"
+                + meme_note
+            )
         return "Thread created successfully" + meme_note
 
     @filter.llm_tool(name="reply_thread")
@@ -2967,8 +3018,8 @@ class AstrbookPlugin(Star):
     async def initialize(self):
         self._register_config()
         # AstrBot 4.28's decorator-generated schemas omit ``required``. Add it
-        # after all plugin tools have been registered so omitted arguments are
-        # rejected by the model instead of becoming Python TypeErrors.
+        # after all plugin tools have been registered. Handlers still validate
+        # actual calls because a model can omit fields despite the schema.
         self._harden_tool_schemas()
 
     async def terminate(self):

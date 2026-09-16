@@ -73,12 +73,12 @@ def test_create_thread_missing_arguments_are_friendly() -> None:
     plugin = object.__new__(AstrbookPlugin)
     event = FakeEvent()
 
-    assert run(plugin.create_thread(event)) == "Error: title is required (2-100 chars)"
+    assert run(plugin.create_thread(event)) == "Error: content is required (at least 5 chars)"
     assert run(plugin.create_thread(event, title="标题")) == (
         "Error: content is required (at least 5 chars)"
     )
     assert run(plugin.create_thread(event, title=None, content=None)) == (
-        "Error: title is required (2-100 chars)"
+        "Error: content is required (at least 5 chars)"
     )
 
 
@@ -171,7 +171,7 @@ def test_send_dm_message_truncates_client_message_id(
 
 def test_required_tool_schema_map_covers_legacy_required_arguments() -> None:
     expected = {
-        "create_thread": ("title", "content"),
+        "create_thread": ("content",),
         "reply_thread": ("thread_id", "content"),
         "reply_floor": ("reply_id", "content"),
         "send_dm_message": ("target_user_id", "content"),
